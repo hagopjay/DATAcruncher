@@ -1,0 +1,194 @@
+"""
+Key Features of This Script:
+
+File Analysis: Counts and sizes of different file types are calculated and visualized.
+
+Text Content Analysis: Common words are identified and visualized using a word cloud.
+
+Topic Modeling: Latent Dirichlet Allocation (LDA) is used to identify topics within the text data.
+
+JSON Metadata Analysis: The structure of JSON files is analyzed to understand the types of data stored.
+
+Temporal Patterns: If there are timestamps within your JSON files or other text-based data formats that 
+can be parsed into dates/times (e.g., logs), this script attempts to extract and visualize them.
+
+
+
+Notes:
+
+Ensure you replace '/path/to/your/google/data/' with the actual path to your Google data.
+
+The script is designed to be comprehensive but may need adjustments based on the specific structure of your files.
+
+Given the large amount of data you have (250 GB), consider running this script on a machine with sufficient memory 
+and processing power. 
+
+You might also want to process subsets of your data at a time to manage resource usage effectively.
+
+This script should provide a robust starting point for exploring and understanding your Google data archive.
+
+"""
+
+
+import os
+import json
+from collections import defaultdict, Counter
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.decomposition import LatentDirichletAllocation
+import nltk
+from nltk.corpus import stopwords
+
+# Download NLTK stopwords if not already downloaded
+nltk.download('stopwords')
+
+# Path to the folder containing the downloaded Google data
+path = '/path/to/your/google/data/'
+
+# File analysis: Count and size by type
+data_summary = {'file_type_count': defaultdict(int), 'file_type_size': defaultdict(int)}
+
+for root, dirs, files in os.walk(path):
+    for file in files:
+        file_extension = os.path.splitext(file)[1].lower()
+        data_summary['file_type_count'][file_extension] += 1
+        file_path = os.path.join(root, file)
+        data_summary['file_type_size'][file_extension] += os.path.getsize(file_path)
+
+# Convert size from bytes to gigabytes
+data_summary['file_type_size'] = {ext: size / (1024 ** 3) for ext, size in data_summary['file_type_size'].items()}
+
+# Visualize file type distribution
+plt.figure(figsize=(10, 5))
+plt.bar(data_summary['file_type_count'].keys(), data_summary['file_type_count'].values())
+plt.title('File Type Distribution')
+plt.xlabel('File Type')
+plt.ylabel('Count')
+plt.show()
+
+# Visualize file size distribution
+plt.figure(figsize=(10, 5))
+plt.bar(data_summary['file_type_size'].keys(), data_summary['file_type_size'].values())
+plt.title('File Size Distribution (GB)')
+plt.xlabel('File Type')
+plt.ylabel('Size (GB)')
+plt.show()
+
+# Text content analysis
+word_counts = Counter()
+text_data = []
+
+def analyze_text_file(file_path):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        content = file.read()
+    words = content.lower().split()
+    return Counter(words)
+
+for root, dirs, files in os.walk(path):
+    for file in files:
+        if file.endswith(('.txt', '.json', '.html')):
+            file_path = os.path.join(root, file)
+            word_counts += analyze_text_file(file_path)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text_data.append(f.read())
+
+# Remove stopwords from word counts
+stop_words = set(stopwords.words('english'))
+word_counts = {word: count for word, count in word_counts.items() if word not in stop_words}
+
+# Display most common words
+print("Most common words:", word_counts.most_common(20))
+
+# Create a word cloud
+wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(word_counts)
+plt.figure(figsize=(10, 5))
+plt.imshow(wordcloud, interpolation='bilinear')
+plt.axis('off')
+plt.show()
+
+# Topic modeling using LDA
+vectorizer = CountVectorizer(max_df=0.95, min_df=2, stop_words='english')
+count_data = vectorizer.fit_transform(text_data)
+
+lda_model = LatentDirichletAllocation(n_components=5, random_state=42)
+lda_model.fit(count_data)
+
+def display_topics(model, feature_names, num_top_words):
+    for topic_idx, topic in enumerate(model.components_):
+        top_words = [feature_names[i] for i in topic.argsort()[:-num_top_words - 1:-1]]
+        print(f"Topic {topic_idx}: {', '.join(top_words)}")
+
+display_topics(lda_model, vectorizer.get_feature_names_out(), 10)
+
+# JSON metadata analysis
+json_structure = defaultdict(set)
+
+def analyze_json(data, prefix=''):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            new_prefix = f"{prefix}.{key}" if prefix else key
+            json_structure[new_prefix].add(type(value).__name__)
+            analyze_json(value, new_prefix)
+    elif isinstance(data, list):
+        for item in data:
+            analyze_json(item, f"{prefix}[]")
+
+for root, dirs, files in os.walk(path):
+    for file in files:
+        if file.endswith('.json'):
+            file_path = os.path.join(root, file)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                try:
+                    data = json.load(f)
+                    analyze_json(data)
+                except json.JSONDecodeError:
+                    print(f"Error decoding JSON in file: {file_path}")
+
+print("JSON Structure Analysis:")
+for key, types in json_structure.items():
+    print(f"{key}: {', '.join(types)}")
+
+# Additional analysis: Temporal patterns (if timestamps are available)
+timestamps = []
+
+def extract_timestamps(data):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if 'time' in key.lower() or 'date' in key.lower():
+                try:
+                    timestamps.append(pd.to_datetime(value))
+                except Exception:
+                    pass
+            extract_timestamps(value)
+    elif isinstance(data, list):
+        for item in data:
+            extract_timestamps(item)
+
+for root, dirs, files in os.walk(path):
+    for file in files:
+        if file.endswith('.json'):
+            file_path = os.path.join(root, file)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                try:
+                    data = json.load(f)
+                    extract_timestamps(data)
+                except json.JSONDecodeError:
+                    continue
+
+if timestamps:
+    import pandas as pd
+
+    # Convert timestamps to a DataFrame and plot them
+    df_timestamps = pd.DataFrame(timestamps, columns=['timestamp'])
+    df_timestamps['year'] = df_timestamps['timestamp'].dt.year
+
+    plt.figure(figsize=(10, 5))
+    df_timestamps['year'].value_counts().sort_index().plot(kind='bar')
+    plt.title('Temporal Distribution of Data')
+    plt.xlabel('Year')
+    plt.ylabel('Count')
+    plt.show()
+
+
+
