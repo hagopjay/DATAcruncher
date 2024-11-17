@@ -1,0 +1,212 @@
+# main.py
+import json
+import logging
+import os
+from flask import Flask, request, jsonify
+from google.cloud import storage
+from inference_adapter import InferenceAdapter
+from gcs_adapter import GCSAdapter
+
+app = Flask(__name__)
+
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+
+contextual_retrieval_prompt = """
+    <document>
+    {doc_content}
+    </document>
+
+    Here is the chunk we want to situate within the whole document
+    <chunk>
+    {chunk_content}
+    </chunk>
+
+    Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk.
+    Answer only with the succinct context and nothing else.
+    """
+
+@app.route("/process", methods=["POST"])
+def process_documents():
+    try:
+        request_json = request.get_json()
+        logger.debug('input={}'.format(json.dumps(request_json)))
+
+        gcs_adapter = GCSAdapter()
+        inference_adapter = InferenceAdapter()
+
+        # Extract relevant information from the input request
+        input_files = request_json.get('inputFiles')
+        input_bucket = request_json.get('bucketName')
+
+        if not all([input_files, input_bucket]):
+            raise ValueError("Missing required input parameters")
+
+        output_files = []
+        for input_file in input_files:
+            processed_batches = []
+            for batch in input_file.get('contentBatches'):
+                # Get chunks from GCS
+                input_key = batch.get('key')
+
+                if not input_key:
+                    raise ValueError("Missing uri in content batch")
+
+                # Read file from GCS
+                file_content = gcs_adapter.read_from_gcs(bucket_name=input_bucket, file_name=input_key)
+                print(file_content.get('fileContents'))
+
+                # Combine all chunks to build content of original file
+                original_document_content = ''.join(content.get('contentBody') for content in file_content.get('fileContents') if content)
+
+                # Process one chunk at a time
+                chunked_content = {
+                    'fileContents': []
+                }
+                
+                for content in file_content.get('fileContents'):
+                    content_body = content.get('contentBody', '')
+                    content_type = content.get('contentType', '')
+                    content_metadata = content.get('contentMetadata', {})
+
+                    # Update chunk with additional context
+                    prompt = contextual_retrieval_prompt.format(doc_content=original_document_content, chunk_content=content_body)
+                    response = inference_adapter.generate_text(prompt)
+                    chunk_context = response if response else ''
+
+                    # append chunk to output file content
+                    chunked_content['fileContents'].append({
+                        "contentBody": chunk_context + "\n\n" + content_body,
+                        "contentType": content_type,
+                        "contentMetadata": content_metadata,
+                    })
+
+                output_key = f"Output/{input_key}"
+
+                # write updated chunk to output GCS
+                gcs_adapter.write_output_to_gcs(input_bucket, output_key, chunked_content)
+
+                # Append the processed chunks file to list of files
+                processed_batches.append({"key": output_key})
+                
+            output_files.append({
+                "originalFileLocation": input_file.get('originalFileLocation'),
+                "fileMetadata": {},
+                "contentBatches": processed_batches
+            })
+
+        return jsonify({"outputFiles": output_files})
+
+    except Exception as e:
+        logger.error(f"Error processing request: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
+
+
+
+
+################################################################################################
+# inference_adapter.py
+import os
+from google.cloud import aiplatform
+from vertexai.language_models import TextGenerationModel
+
+class InferenceAdapter:
+    def __init__(self):
+        # Initialize Vertex AI
+        aiplatform.init(
+            project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
+            location=os.environ.get("GOOGLE_CLOUD_REGION", "us-central1")
+        )
+        self.model = TextGenerationModel.from_pretrained("text-bison")
+
+    def generate_text(self, prompt, max_tokens=1000):
+        try:
+            response = self.model.predict(
+                prompt,
+                temperature=0.0,
+                max_output_tokens=max_tokens
+            )
+            return response.text
+        except Exception as e:
+            print(f"An error occurred during text generation: {e}")
+            return None
+
+
+
+####################  storage for Gemini
+# gcs_adapter.py
+import json
+from google.cloud import storage
+from google.cloud.exceptions import GoogleCloudError
+
+class GCSAdapter:
+    def __init__(self):
+        self.storage_client = storage.Client()
+
+    def write_output_to_gcs(self, bucket_name, file_name, json_data):
+        """
+        Write a JSON object to a GCS bucket
+
+        :param bucket_name: Name of the GCS bucket
+        :param file_name: Name of the file to be created in the bucket
+        :param json_data: JSON object to be written
+        :return: True if file was uploaded, else False
+        """
+        try:
+            bucket = self.storage_client.bucket(bucket_name)
+            blob = bucket.blob(file_name)
+
+            # Convert JSON object to string
+            json_string = json.dumps(json_data)
+
+            # Upload the file
+            blob.upload_from_string(
+                json_string,
+                content_type='application/json'
+            )
+
+            print(f"Successfully uploaded {file_name} to {bucket_name}")
+            return True
+
+        except GoogleCloudError as e:
+            print(f"Error occurred: {e}")
+            return False
+
+    def read_from_gcs(self, bucket_name, file_name):
+        """
+        Read a JSON object from a GCS bucket
+
+        :param bucket_name: Name of the GCS bucket
+        :param file_name: Name of the file to be read
+        :return: JSON object if file was read successfully, else None
+        """
+        try:
+            bucket = self.storage_client.bucket(bucket_name)
+            blob = bucket.blob(file_name)
+
+            # Download and decode the file content
+            content = blob.download_as_string()
+            return json.loads(content.decode('utf-8'))
+
+        except GoogleCloudError as e:
+            print(f"Error reading file from GCS: {str(e)}")
+            return None
+
+    def parse_gcs_path(self, gcs_path):
+        # Remove 'gs://' prefix if present
+        gcs_path = gcs_path.replace('gs://', '')
+
+        # Split the path into bucket and key
+        parts = gcs_path.split('/', 1)
+
+        if len(parts) != 2:
+            raise ValueError("Invalid GCS path format")
+
+        bucket_name = parts[0]
+        file_key = parts[1]
+
+        return bucket_name, file_key
